@@ -1,4 +1,6 @@
 #include "BLEDevice.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string>
 #include <string.h>
 
@@ -9,9 +11,13 @@
 #define FIRST_ECHO_PIN 15
 #define SECOND_TRIG_PIN 25
 #define SECOND_ECHO_PIN 33
-#define LED_PIN 13
+#define CONNECTION_LED_PIN 13
+#define STATUS_LED_PIN 0
 
 #define PROXIMITY_PAUSE 3000
+
+#define ULTRASONIC_ONE 1
+#define ULTRASONIC_TWO 2
 
 BLEScan* scanner;
 BLEAdvertisedDevice targetDevice;
@@ -102,7 +108,7 @@ void startScan() {
     shouldStart = connectToServer(&targetDevice);
     if (shouldStart) {
       // Turn the LED on to indicate connection was successful
-      digitalWrite(LED_PIN, HIGH);
+      digitalWrite(CONNECTION_LED_PIN, HIGH);
       if (client != nullptr) {
         client->setClientCallbacks(new MyClientCallbacks());
       }
@@ -122,9 +128,9 @@ void retryConnection() {
   Serial.println("Couldn't find/connect to the host ESP32 server. Reattempting connection in 30s.");
   for (int i = 0; i < 15; i++) {
     Serial.print(".");
-    digitalWrite(LED_PIN, HIGH);
+    digitalWrite(CONNECTION_LED_PIN, HIGH);
     delay(1000);
-    digitalWrite(LED_PIN, LOW);
+    digitalWrite(CONNECTION_LED_PIN, LOW);
     delay(1000);
   }
   startScan();
@@ -137,6 +143,22 @@ void sendBluetoothMessage(String message, BLERemoteCharacteristic* characteristi
 }
 
 
+class UltrasonicStatusListener {
+  public:
+  virtual void onUltrasonicStatusChanged(bool newStatus, int sensorNumber) = 0;
+};
+
+class ImplementedListener : public UltrasonicStatusListener {
+  public:
+  void onUltrasonicStatusChanged(bool newStatus, int sensorNumber) override;
+};
+
+void ImplementedListener::onUltrasonicStatusChanged(bool newStatus, int sensorNumber) {
+  Serial.print("Status changed for ultrasonic ");
+  Serial.print(sensorNumber);
+  Serial.print(": ");
+  Serial.println(newStatus);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Proximity sensor class definition/parameters
@@ -145,6 +167,7 @@ void sendBluetoothMessage(String message, BLERemoteCharacteristic* characteristi
 ////////////////////////////////////////////////////////////////////////////////////////
 class UltrasonicSensor {
   private:
+    UltrasonicStatusListener* listener;
     int trigger_pin;
     int echo_pin;
     long duration;
@@ -155,22 +178,28 @@ class UltrasonicSensor {
     bool proximityLockLow = true;
     bool proximityTakeLowTime;
     long unsigned int proximityLowIn;
+    int sensorNumber;
 
     // Boolean that indicates status of the ultrasonic sensor (active or nonactive)
     bool detected = false;
+    bool previousStatus = false;
 
     // Flag that is set to true whenenver the vibration sensor is active
     // When the system is moved, we need to recalibrate the ultrasonic's baseline
     static bool shouldRetakeBaseline;
 
   public:
-    UltrasonicSensor(int trig_pin, int echo_pin) {
+    UltrasonicSensor(int trig_pin, int echo_pin, int sensor_number) {
       pinMode(trig_pin, OUTPUT);
       pinMode(echo_pin, INPUT);
       trigger_pin = trig_pin;
       this->echo_pin = echo_pin;
+      sensorNumber = sensor_number;
     }
 
+    void setListener(UltrasonicStatusListener* listener) {
+      this->listener = listener;
+    }
     int distance() {
       return distance_;
     }
@@ -232,6 +261,9 @@ class UltrasonicSensor {
           detected = false;
         }
       }
+      if (previousStatus != detected) {
+        listener->onUltrasonicStatusChanged(detected, sensorNumber);
+      }
     }
 
     void start() {
@@ -262,6 +294,18 @@ bool isRoomOccupied = false;
 String roomStatus = "";
 
 
+void updateLED(void* parameter) {
+  while (true) {
+   if (isRoomOccupied) {
+    digitalWrite(STATUS_LED_PIN, HIGH);
+  } else {
+    digitalWrite(STATUS_LED_PIN, LOW);
+    }
+  }
+  delay(50);
+}
+
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // START OF SETUP AND LOOP
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -269,10 +313,15 @@ String roomStatus = "";
 void setup() {
   Serial.begin(115200);
   Serial.print("Serial port setup complete");
-  firstUltrasonicSensor = new UltrasonicSensor(FIRST_TRIG_PIN, FIRST_ECHO_PIN);
-  secondUltrasonicSensor = new UltrasonicSensor(SECOND_TRIG_PIN, SECOND_ECHO_PIN);
+  firstUltrasonicSensor = new UltrasonicSensor(FIRST_TRIG_PIN, FIRST_ECHO_PIN, ULTRASONIC_ONE);
+  secondUltrasonicSensor = new UltrasonicSensor(SECOND_TRIG_PIN, SECOND_ECHO_PIN, ULTRASONIC_TWO);
+  firstUltrasonicSensor->setListener(new ImplementedListener());
+  secondUltrasonicSensor->setListener(new ImplementedListener());
 
-  pinMode(LED_PIN, OUTPUT);
+  pinMode(CONNECTION_LED_PIN, OUTPUT);
+  pinMode(STATUS_LED_PIN, OUTPUT);
+
+  xTaskCreatePinnedToCore(updateLED, "STATUS_LED", 10000, NULL, 0, NULL, 0);
 
   BLEDevice::init("ESP32 Subsystem");
   scanner = BLEDevice::getScan();
@@ -285,10 +334,12 @@ void loop() {
   if (shouldStart) {
     firstUltrasonicSensor->start();
     secondUltrasonicSensor->start();
-    Serial.print("Ultrasonic 1: ");
-    Serial.println(firstUltrasonicSensor->isActive());
-    Serial.print("Ultrasonic 2: ");
-    Serial.println(secondUltrasonicSensor->isActive());
+    if (firstUltrasonicSensor->isActive()) {
+      Serial.println("Ultrasonic 1 currently active");
+    }
+    if (secondUltrasonicSensor->isActive()) {
+      Serial.println("Ultrasonic 2 currently active");
+    }
 
     if (firstUltrasonicSensor->isActive() && secondUltrasonicSensor->isActive()) {
       switch (direction) {

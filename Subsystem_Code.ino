@@ -3,6 +3,9 @@
 #include "freertos/task.h"
 #include <string>
 #include <string.h>
+#include <vector>
+#include <functional>
+#include <thread>
 
 #define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define SUBSYSTEM_CHARACTERISTIC_UUID "cba1d466-344c-4be3-ab3f-189f80dd7518"
@@ -19,9 +22,10 @@
 #define ULTRASONIC_ONE 1
 #define ULTRASONIC_TWO 2
 
+#define NUM_SYSTEMS 1
+
 BLEScan* scanner;
 BLEAdvertisedDevice targetDevice;
-BLEClient* client;
 
 // BLECharacteristic that we will be writing to
 BLERemoteCharacteristic* characteristic;
@@ -30,16 +34,114 @@ bool shouldAttemptConnect = false;
 // If connection to the main ESP32 succeeds, this will be set to true
 bool shouldStart = false;
 
+
+void sendBluetoothMessage(String message, BLERemoteCharacteristic* characteristic) {
+  uint8_t data[message.length() + 1];
+  memcpy(data, message.c_str(), message.length());
+  characteristic->writeValue(data, message.length());
+}
+
+class ConnectionsManager {
+  private:
+  // Storing references to remote characteristics of all systems within a room
+  std::map<BLEClient*, BLERemoteCharacteristic*> clientCharacteristicMapping;
+  std::map<BLEAddress, bool> addressMapping;
+  static ConnectionsManager* instance;
+  public:
+  static ConnectionsManager* getInstance();
+  void addClientCharacteristicPair(BLEClient* client, BLERemoteCharacteristic* characteristic);
+  bool removeClientCharacteristicPair(BLEClient* client);
+  void setAddressMapping(BLEAddress deviceAddress, bool connectionStatus);
+  bool isConnectedToDevice(BLEAddress address);
+  void setValuesForCharacteristics(String message);
+  bool shouldStart() const;
+};
+
+ConnectionsManager* ConnectionsManager::instance = nullptr;
+
+ConnectionsManager* ConnectionsManager::getInstance() {
+  if (instance == nullptr || instance == NULL) {
+    instance = new ConnectionsManager;
+  }
+  return instance;
+}
+
+void ConnectionsManager::addClientCharacteristicPair(BLEClient* client, BLERemoteCharacteristic* characteristic) {
+  clientCharacteristicMapping[client] = characteristic;
+}
+
+bool ConnectionsManager::removeClientCharacteristicPair(BLEClient* client) {
+   return clientCharacteristicMapping.erase(client) > 0;
+}
+
+void ConnectionsManager::setAddressMapping(BLEAddress address, bool connectionStatus) {
+  addressMapping[address] = connectionStatus;
+}
+
+bool ConnectionsManager::isConnectedToDevice(BLEAddress address) {
+  if (addressMapping.find(address) == addressMapping.end() || !addressMapping[address]) {
+    return false;
+  } else {
+    return true;
+  }
+}
+
+// Method to check if the subsystem is connected successfully to all the ESP32 systems
+bool ConnectionsManager::shouldStart() const {
+  if (addressMapping.empty()) {
+    return false;
+  }
+  for (auto it = addressMapping.begin(); it != addressMapping.end(); ++it) {
+    if (!(it->second)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void ConnectionsManager::setValuesForCharacteristics(String message) {
+  for (auto it = clientCharacteristicMapping.begin(); it != clientCharacteristicMapping.end(); ++it) {
+    sendBluetoothMessage(message, it->second);
+  }
+}
+
+// Singleton ConnectionsManager object that will manage a list of all of the characteristics of the systems in the room
+ConnectionsManager* connectionsManager = ConnectionsManager::getInstance();
+
+
+class MyClientCallbacks : public BLEClientCallbacks {
+    void onConnect(BLEClient* client) override;
+    void onDisconnect(BLEClient* client) override;
+};
+
+void MyClientCallbacks::onConnect(BLEClient* client) {
+  
+}
+
+void MyClientCallbacks::onDisconnect(BLEClient* client) {
+  //retryConnection();
+  if (connectionsManager->removeClientCharacteristicPair(client)) {
+    Serial.print("Disconnected from ");
+    Serial.print(client->toString().c_str());
+    Serial.print(" with peer address: ");
+    Serial.println(client->getPeerAddress().toString().c_str());
+  }
+  connectionsManager->setAddressMapping(client->getPeerAddress(), false);
+  shouldStart = false;
+}
+
+
 bool connectToServer(BLEAdvertisedDevice* device) {
   Serial.println("Beginning BLE connection with main ESP32...");
   // Obtain the client handle
-  client = BLEDevice::createClient();
+  BLEClient* client = BLEDevice::createClient();
   if (client == nullptr) {
     Serial.print("Error establishing BLEClient");
     return false;
   } else {
     Serial.println("BLEClient success");
   }
+  client->setClientCallbacks(new MyClientCallbacks());
   client->connect(device);
 
   // Attempt a connection to the BLEService with the target service UUID
@@ -63,6 +165,7 @@ bool connectToServer(BLEAdvertisedDevice* device) {
   } else {
     Serial.println("Remote characteristic success!");
   }
+  connectionsManager->addClientCharacteristicPair(client, characteristic);
   std::string characteristicString = characteristic->toString();
   Serial.print("Connected to characteristic: ");
   Serial.println(characteristicString.c_str());
@@ -76,7 +179,8 @@ class AdvertisedDeviceCallback : public BLEAdvertisedDeviceCallbacks {
 
 void AdvertisedDeviceCallback::onResult(BLEAdvertisedDevice advertisedDevice) {
   Serial.println(advertisedDevice.getName().c_str());
-  if (advertisedDevice.getName() == std::string("ESP32")) {
+  // When the scanner picks up an ESP32 and the subsystem is not yet connected to it, attempt to connect
+  if (advertisedDevice.getName() == std::string("ESP32") && !connectionsManager->isConnectedToDevice(advertisedDevice.getAddress())) {
     Serial.println("Located main ESP32");
     BLEAddress targetAddress = advertisedDevice.getAddress();
     std::string addressString = targetAddress.toString();
@@ -87,38 +191,21 @@ void AdvertisedDeviceCallback::onResult(BLEAdvertisedDevice advertisedDevice) {
   }
 }
 
-class MyClientCallbacks : public BLEClientCallbacks {
-    void onConnect(BLEClient* client) override;
-    void onDisconnect(BLEClient* client) override;
-};
-
-void MyClientCallbacks::onConnect(BLEClient* client) {
-
-}
-
-void MyClientCallbacks::onDisconnect(BLEClient* client) {
-  //retryConnection();
-  shouldStart = false;
-}
 
 void startScan() {
   Serial.println("Starting BLE scan...");
   scanner->start(15);
   if (shouldAttemptConnect) {
     shouldStart = connectToServer(&targetDevice);
+    connectionsManager->setAddressMapping(targetDevice.getAddress(), shouldStart);
     if (shouldStart) {
       // Turn the LED on to indicate connection was successful
       digitalWrite(CONNECTION_LED_PIN, HIGH);
-      if (client != nullptr) {
-        client->setClientCallbacks(new MyClientCallbacks());
-      }
     }
   }
 }
 
 void clearClientInfo() {
-  client = nullptr;
-  characteristic = nullptr;
   shouldAttemptConnect = false;
   
 }
@@ -135,13 +222,6 @@ void retryConnection() {
   }
   startScan();
 }
-
-void sendBluetoothMessage(String message, BLERemoteCharacteristic* characteristic) {
-  uint8_t data[message.length() + 1];
-  memcpy(data, message.c_str(), message.length());
-  characteristic->writeValue(data, message.length());
-}
-
 
 class UltrasonicStatusListener {
   public:
@@ -274,7 +354,6 @@ class UltrasonicSensor {
 bool UltrasonicSensor::shouldRetakeBaseline = false;
 
 
-
 // First sensor will be the left sensor
 UltrasonicSensor* firstUltrasonicSensor;
 
@@ -327,11 +406,15 @@ void setup() {
   scanner = BLEDevice::getScan();
   scanner->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallback());
   scanner->setActiveScan(true);
-  startScan();
+
+  for (int i = 0; i < NUM_SYSTEMS; i++) {
+      shouldAttemptConnect = false;
+      startScan();
+  }
 }
 
 void loop() {
-  if (shouldStart) {
+  if (connectionsManager->shouldStart()) {
     firstUltrasonicSensor->start();
     secondUltrasonicSensor->start();
     if (firstUltrasonicSensor->isActive()) {
@@ -375,7 +458,10 @@ void loop() {
           //characteristic->writeValue(static_cast<uint8_t>(isRoomOccupied));
 
       }
-      sendBluetoothMessage(roomStatus, characteristic);
+      connectionsManager->setValuesForCharacteristics(roomStatus);
+//      for (BLERemoteCharacteristic* characteristic : *(connectionsManager->getCharacteristics())) {
+//         sendBluetoothMessage(roomStatus, characteristic);
+//      }
     }
   } else {
     // Implement the retry functionality here

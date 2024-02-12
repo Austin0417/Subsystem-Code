@@ -3,9 +3,9 @@
 #include "freertos/task.h"
 #include <string>
 #include <string.h>
-#include <vector>
+#include <map>
 #include <functional>
-#include <thread>
+#include <future>
 
 #define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define SUBSYSTEM_CHARACTERISTIC_UUID "cba1d466-344c-4be3-ab3f-189f80dd7518"
@@ -41,11 +41,61 @@ void sendBluetoothMessage(String message, BLERemoteCharacteristic* characteristi
   characteristic->writeValue(data, message.length());
 }
 
+////////////////////////////////////////////////////////////////////////////////////////
+// Helper class to manage the current room occupation status
+// Will use singleton design pattern
+////////////////////////////////////////////////////////////////////////////////////////
+
+class RoomOccupationStatus {
+  private:
+    static RoomOccupationStatus* instance;
+    bool occupied = false;
+    String roomStatus = "Not occupied"; // roomStatus will be indirectly set through setOccupied and setUnoccupied
+    std::function<void(String)> onRoomStatusChanged;
+  public:
+    static RoomOccupationStatus* getInstance();
+    void setOnRoomStatusChangedListener(std::function<void(String)> callback);
+    bool isOccupied() const;
+    String getRoomStatus() const;
+    void setOccupied();
+    void setUnoccupied();
+};
+
+RoomOccupationStatus* RoomOccupationStatus::instance = nullptr;
+
+RoomOccupationStatus* RoomOccupationStatus::getInstance() {
+  if (instance == nullptr) {
+      instance = new RoomOccupationStatus;
+  }
+  return instance;
+}
+
+void RoomOccupationStatus::setOnRoomStatusChangedListener(std::function<void(String)> callback) { onRoomStatusChanged = callback; }
+bool RoomOccupationStatus::isOccupied() const { return occupied; }
+String RoomOccupationStatus::getRoomStatus() const { return roomStatus; }
+
+void RoomOccupationStatus::setOccupied() { 
+  occupied = true;
+  roomStatus = "Occupied";
+}
+
+void RoomOccupationStatus::setUnoccupied() {
+  occupied = false;
+  roomStatus = "Not occupied"; 
+}
+
+// Singleton instance of RoomOccupationStatus
+RoomOccupationStatus* roomOccupationInstance = RoomOccupationStatus::getInstance();
+
+////////////////////////////////////////////////////////////////////////////////////////
+// Helper class to manage subsystem's connections to potentially multiple main systems
+// Uses Singleton design pattern as well
+////////////////////////////////////////////////////////////////////////////////////////
 class ConnectionsManager {
   private:
   // Storing references to remote characteristics of all systems within a room
-  std::map<BLEClient*, BLERemoteCharacteristic*> clientCharacteristicMapping;
-  std::map<BLEAddress, bool> addressMapping;
+  std::map<BLEClient*, BLERemoteCharacteristic*> clientCharacteristicMapping;   // map which links every client connection (to each main system) to the respective characteristics on that main system
+  std::map<BLEAddress, bool> addressMapping;  // map to keep track of each main system (key is unique bluetooth address, value is boolean representing current connection to the device)
   static ConnectionsManager* instance;
   public:
   static ConnectionsManager* getInstance();
@@ -54,6 +104,7 @@ class ConnectionsManager {
   void setAddressMapping(BLEAddress deviceAddress, bool connectionStatus);
   bool isConnectedToDevice(BLEAddress address);
   void setValuesForCharacteristics(String message);
+  static void sendValues(ConnectionsManager* connectionManager);
   bool shouldStart() const;
 };
 
@@ -64,6 +115,10 @@ ConnectionsManager* ConnectionsManager::getInstance() {
     instance = new ConnectionsManager;
   }
   return instance;
+}
+
+void ConnectionsManager::sendValues(ConnectionsManager* connectionManager) {
+  connectionManager->setValuesForCharacteristics(roomOccupationInstance->getRoomStatus());
 }
 
 void ConnectionsManager::addClientCharacteristicPair(BLEClient* client, BLERemoteCharacteristic* characteristic) {
@@ -108,7 +163,47 @@ void ConnectionsManager::setValuesForCharacteristics(String message) {
 // Singleton ConnectionsManager object that will manage a list of all of the characteristics of the systems in the room
 ConnectionsManager* connectionsManager = ConnectionsManager::getInstance();
 
+////////////////////////////////////////////////////////////////////////////////////////
+// Helper class that will send the room occupation status to all main systems asynchronously
+////////////////////////////////////////////////////////////////////////////////////////
+class BluetoothMessenger {
+  private:
+  static BluetoothMessenger* instance;
+  static bool shouldSendStatus;
+  public:
+  static BluetoothMessenger* getInstance();
+  void initializeMessageService();
+  void startMessageService();
+  void stopMessageService();
+};
 
+BluetoothMessenger* BluetoothMessenger::instance = nullptr;
+bool BluetoothMessenger::shouldSendStatus = false;
+
+BluetoothMessenger* BluetoothMessenger::getInstance() {
+  if (instance == nullptr) {
+    instance = new BluetoothMessenger;
+  }
+  return instance;
+}
+
+void BluetoothMessenger::initializeMessageService() {
+  xTaskCreatePinnedToCore([] (void* args) {
+    Serial.println("Initializing asynchronous BLE messenger...");
+    while (true) {
+      if (shouldSendStatus) {
+        connectionsManager->setValuesForCharacteristics(roomOccupationInstance->getRoomStatus());
+      }
+    }
+    }, "BLUETOOTH_MESSENGER", 10000, NULL, 0, NULL, 0);
+}
+
+void BluetoothMessenger::startMessageService() { shouldSendStatus = true; }
+void BluetoothMessenger::stopMessageService() { shouldSendStatus = false; }
+
+////////////////////////////////////////////////////////////////////////////////////////
+// Class inheriting from BLEClientCallbacks which implements pure virtual methods (onConnect and onDisconnect) which serve as callbacks
+////////////////////////////////////////////////////////////////////////////////////////
 class MyClientCallbacks : public BLEClientCallbacks {
     void onConnect(BLEClient* client) override;
     void onDisconnect(BLEClient* client) override;
@@ -240,6 +335,7 @@ void ImplementedListener::onUltrasonicStatusChanged(bool newStatus, int sensorNu
   Serial.println(newStatus);
 }
 
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Proximity sensor class definition/parameters
 // Trig pin goes to GIOP 2
@@ -247,7 +343,7 @@ void ImplementedListener::onUltrasonicStatusChanged(bool newStatus, int sensorNu
 ////////////////////////////////////////////////////////////////////////////////////////
 class UltrasonicSensor {
   private:
-    UltrasonicStatusListener* listener;
+    UltrasonicStatusListener* listener = nullptr;
     int trigger_pin;
     int echo_pin;
     long duration;
@@ -317,11 +413,14 @@ class UltrasonicSensor {
       if (!isCalibrated || shouldRetakeBaseline) {
         calibratedValue = distance_;
         isCalibrated = true;
-        Serial.println("Calibrated value is: ");
+        Serial.print("Sensor Number ");
+        Serial.print(sensorNumber);
+        Serial.print(" Calibrated value is: ");
         Serial.print(calibratedValue);
-        Serial.print(" cm");
+        Serial.println(" cm");
+        shouldRetakeBaseline = false;
       }
-      if (distance_ < calibratedValue - 30 || distance_ > calibratedValue + 30) {
+      if (distance_ < calibratedValue - 20) {
         lastActiveProximity = millis();
         detected = true;
         if (proximityLockLow) {
@@ -341,9 +440,6 @@ class UltrasonicSensor {
           detected = false;
         }
       }
-      if (previousStatus != detected) {
-        listener->onUltrasonicStatusChanged(detected, sensorNumber);
-      }
     }
 
     void start() {
@@ -354,11 +450,6 @@ class UltrasonicSensor {
 bool UltrasonicSensor::shouldRetakeBaseline = false;
 
 
-// First sensor will be the left sensor
-UltrasonicSensor* firstUltrasonicSensor;
-
-// Second sensor will be the right sensor
-UltrasonicSensor* secondUltrasonicSensor;
 
 // Enum indicating which direction the door is on from the perspective of the system. Default value will be left.
 enum DoorDirection {
@@ -366,16 +457,49 @@ enum DoorDirection {
   RIGHT
 };
 
+class Button {
+ private:
+  int input_pin_;
+  void (*interrupt_handler_)() = nullptr;
+ public:
+  Button(int input_pin_) : input_pin_(input_pin_) {}
+  Button(int input_pin_, void (*handler)()) {
+    this->input_pin_ = input_pin_;
+    interrupt_handler_ = handler; 
+   }
+  void SetISR(void (*handler)()) {
+    interrupt_handler_ = handler; 
+   }
+  void Init() {
+     if (interrupt_handler_ == nullptr) {
+      Serial.println("Button ISR was never set");
+      return;
+     }
+     pinMode(input_pin_, INPUT);
+     attachInterrupt(input_pin_, interrupt_handler_, RISING);
+  }
+};
+
+
+void IRAM_ATTR ButtonPressISR() {
+  UltrasonicSensor::setBaselineFlag(true);
+}
+
+Button button(32, ButtonPressISR);
+
+BluetoothMessenger* bluetoothMessenger = BluetoothMessenger::getInstance();
+
+// First sensor will be the left sensor
+UltrasonicSensor firstUltrasonicSensor(FIRST_TRIG_PIN, FIRST_ECHO_PIN, ULTRASONIC_ONE);
+
+// Second sensor will be the right sensor
+UltrasonicSensor secondUltrasonicSensor(SECOND_TRIG_PIN, SECOND_ECHO_PIN, ULTRASONIC_TWO);
+
 DoorDirection direction = DoorDirection::LEFT;
-
-// Main global boolean variable that we will write to the BLE characteristic to indicate the room's occupation status (person is present/absent)
-bool isRoomOccupied = false;
-String roomStatus = "";
-
 
 void updateLED(void* parameter) {
   while (true) {
-   if (isRoomOccupied) {
+   if (roomOccupationInstance->isOccupied()) {
     digitalWrite(STATUS_LED_PIN, HIGH);
   } else {
     digitalWrite(STATUS_LED_PIN, LOW);
@@ -384,7 +508,6 @@ void updateLED(void* parameter) {
   delay(50);
 }
 
-
 ////////////////////////////////////////////////////////////////////////////////////////
 // START OF SETUP AND LOOP
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -392,10 +515,12 @@ void updateLED(void* parameter) {
 void setup() {
   Serial.begin(115200);
   Serial.print("Serial port setup complete");
-  firstUltrasonicSensor = new UltrasonicSensor(FIRST_TRIG_PIN, FIRST_ECHO_PIN, ULTRASONIC_ONE);
-  secondUltrasonicSensor = new UltrasonicSensor(SECOND_TRIG_PIN, SECOND_ECHO_PIN, ULTRASONIC_TWO);
-  firstUltrasonicSensor->setListener(new ImplementedListener());
-  secondUltrasonicSensor->setListener(new ImplementedListener());
+  button.Init();
+//  firstUltrasonicSensor = new UltrasonicSensor(FIRST_TRIG_PIN, FIRST_ECHO_PIN, ULTRASONIC_ONE);
+//  secondUltrasonicSensor = new UltrasonicSensor(SECOND_TRIG_PIN, SECOND_ECHO_PIN, ULTRASONIC_TWO);
+//  roomOccupationInstance->setOnRoomStatusChangedListener([] (String updatedStatus) {
+//      Serial.println(updatedStatus.c_str());
+//  });
 
   pinMode(CONNECTION_LED_PIN, OUTPUT);
   pinMode(STATUS_LED_PIN, OUTPUT);
@@ -411,60 +536,45 @@ void setup() {
       shouldAttemptConnect = false;
       startScan();
   }
+  bluetoothMessenger->initializeMessageService();
 }
 
 void loop() {
   if (connectionsManager->shouldStart()) {
-    firstUltrasonicSensor->start();
-    secondUltrasonicSensor->start();
-    if (firstUltrasonicSensor->isActive()) {
-      Serial.println("Ultrasonic 1 currently active");
-    }
-    if (secondUltrasonicSensor->isActive()) {
-      Serial.println("Ultrasonic 2 currently active");
-    }
+    bluetoothMessenger->startMessageService();
+    firstUltrasonicSensor.start();
+    secondUltrasonicSensor.start();
 
-    if (firstUltrasonicSensor->isActive() && secondUltrasonicSensor->isActive()) {
+    if (firstUltrasonicSensor.isActive() && secondUltrasonicSensor.isActive()) {
       switch (direction) {
         case LEFT: {
             // Person is entering the room
-            if (firstUltrasonicSensor->getDetectionTime() < secondUltrasonicSensor->getDetectionTime()) {
-              isRoomOccupied = true;
-              roomStatus = "Occupied";
-
+            if (firstUltrasonicSensor.getDetectionTime() < secondUltrasonicSensor.getDetectionTime()) {
+              roomOccupationInstance->setOccupied();
+              
               // Person is exiting the room
-            } else if (firstUltrasonicSensor->getDetectionTime() > secondUltrasonicSensor->getDetectionTime()) {
-              isRoomOccupied = false;
-              roomStatus = "Not occupied";
+            } else if (firstUltrasonicSensor.getDetectionTime() > secondUltrasonicSensor.getDetectionTime()) {
+              roomOccupationInstance->setUnoccupied();
             }
-            Serial.println(roomStatus.c_str());
             break;
           }
         case RIGHT: {
-
             // Same idea for the LEFT case, but just switch everything around
-            if (firstUltrasonicSensor->getDetectionTime() < secondUltrasonicSensor->getDetectionTime()) {
-              isRoomOccupied = false;
-              roomStatus = "Not occupied";
+            if (firstUltrasonicSensor.getDetectionTime() < secondUltrasonicSensor.getDetectionTime()) {
+              roomOccupationInstance->setUnoccupied();
 
               // Person is exiting the room
-            } else if (firstUltrasonicSensor->getDetectionTime() > secondUltrasonicSensor->getDetectionTime()) {
-              isRoomOccupied = true;
-              roomStatus = "Occupied";
+            } else if (firstUltrasonicSensor.getDetectionTime() > secondUltrasonicSensor.getDetectionTime()) {
+              roomOccupationInstance->setOccupied();
             }
-            Serial.println(roomStatus.c_str());
             break;
           }
-          //characteristic->writeValue(static_cast<uint8_t>(isRoomOccupied));
-
       }
-      connectionsManager->setValuesForCharacteristics(roomStatus);
-//      for (BLERemoteCharacteristic* characteristic : *(connectionsManager->getCharacteristics())) {
-//         sendBluetoothMessage(roomStatus, characteristic);
-//      }
+      //connectionsManager->setValuesForCharacteristics(roomOccupationInstance->getRoomStatus());
     }
   } else {
     // Implement the retry functionality here
+    bluetoothMessenger->stopMessageService();
     retryConnection();
   }
 }

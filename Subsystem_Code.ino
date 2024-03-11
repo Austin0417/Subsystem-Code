@@ -7,9 +7,12 @@
 #include <functional>
 #include <future>
 
+// BLEService and BLECharacteristic UUID
+// These should match the service UUID from the main system, and the characteristic UUID of the subsystem's characteristic on the main system
 #define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define SUBSYSTEM_CHARACTERISTIC_UUID "cba1d466-344c-4be3-ab3f-189f80dd7518"
 
+// Macros for the pin numbers for the ultrasonic sensors and LEDs
 #define FIRST_TRIG_PIN 2
 #define FIRST_ECHO_PIN 15
 #define SECOND_TRIG_PIN 25
@@ -17,6 +20,7 @@
 #define CONNECTION_LED_PIN 13
 #define STATUS_LED_PIN 0
 
+// This is responsible for determining the length of the "hold" of the ultrasonics. Basically how long it stays active after it detected someone walking by
 #define PROXIMITY_PAUSE 3000
 
 #define ULTRASONIC_ONE 1
@@ -51,10 +55,9 @@ class RoomOccupationStatus {
     static RoomOccupationStatus* instance;
     bool occupied = false;
     String roomStatus = "Not occupied"; // roomStatus will be indirectly set through setOccupied and setUnoccupied
-    std::function<void(String)> onRoomStatusChanged;
+    unsigned long time_since_last_status_set_ = 0;
   public:
     static RoomOccupationStatus* getInstance();
-    void setOnRoomStatusChangedListener(std::function<void(String)> callback);
     bool isOccupied() const;
     String getRoomStatus() const;
     void setOccupied();
@@ -70,18 +73,25 @@ RoomOccupationStatus* RoomOccupationStatus::getInstance() {
   return instance;
 }
 
-void RoomOccupationStatus::setOnRoomStatusChangedListener(std::function<void(String)> callback) { onRoomStatusChanged = callback; }
 bool RoomOccupationStatus::isOccupied() const { return occupied; }
 String RoomOccupationStatus::getRoomStatus() const { return roomStatus; }
 
 void RoomOccupationStatus::setOccupied() { 
+  if (millis() - time_since_last_status_set_ < 1500) {
+    return;
+  }
   occupied = true;
   roomStatus = "Occupied";
+  time_since_last_status_set_ = millis();
 }
 
 void RoomOccupationStatus::setUnoccupied() {
+  if (millis() - time_since_last_status_set_ < 1500) {
+    return;
+  }
   occupied = false;
-  roomStatus = "Not occupied"; 
+  roomStatus = "Not occupied";
+  time_since_last_status_set_ = millis();
 }
 
 // Singleton instance of RoomOccupationStatus
@@ -90,6 +100,7 @@ RoomOccupationStatus* roomOccupationInstance = RoomOccupationStatus::getInstance
 ////////////////////////////////////////////////////////////////////////////////////////
 // Helper class to manage subsystem's connections to potentially multiple main systems
 // Uses Singleton design pattern as well
+// This isn't really that important since currently, there is only 1 main system in use
 ////////////////////////////////////////////////////////////////////////////////////////
 class ConnectionsManager {
   private:
@@ -213,8 +224,8 @@ void MyClientCallbacks::onConnect(BLEClient* client) {
   
 }
 
+// If the subsystem has disconnected from the main system, start attempting to reconnect by setting the shouldStart flag back to false
 void MyClientCallbacks::onDisconnect(BLEClient* client) {
-  //retryConnection();
   if (connectionsManager->removeClientCharacteristicPair(client)) {
     Serial.print("Disconnected from ");
     Serial.print(client->toString().c_str());
@@ -225,7 +236,9 @@ void MyClientCallbacks::onDisconnect(BLEClient* client) {
   shouldStart = false;
 }
 
-
+// Function that connects to a given advertised device
+// This is used when the scan picks up the main system
+// Returns true if the connect was successful, false otherwise
 bool connectToServer(BLEAdvertisedDevice* device) {
   Serial.println("Beginning BLE connection with main ESP32...");
   // Obtain the client handle
@@ -268,13 +281,16 @@ bool connectToServer(BLEAdvertisedDevice* device) {
 }
 
 
+// Class that implements the BLEAdvertisedDeviceCallbacks interface
 class AdvertisedDeviceCallback : public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice advertisedDevice) override;
 };
 
+// On a scan result, we check to scanned device's name to see if it matches the main system (in this case the main system is just called "ESP32")
 void AdvertisedDeviceCallback::onResult(BLEAdvertisedDevice advertisedDevice) {
   Serial.println(advertisedDevice.getName().c_str());
   // When the scanner picks up an ESP32 and the subsystem is not yet connected to it, attempt to connect
+  // Set targetAddress and the shouldAttemptConnect flag
   if (advertisedDevice.getName() == std::string("ESP32") && !connectionsManager->isConnectedToDevice(advertisedDevice.getAddress())) {
     Serial.println("Located main ESP32");
     BLEAddress targetAddress = advertisedDevice.getAddress();
@@ -287,9 +303,15 @@ void AdvertisedDeviceCallback::onResult(BLEAdvertisedDevice advertisedDevice) {
 }
 
 
+// Function that will start scanning nearby BLE devices
 void startScan() {
   Serial.println("Starting BLE scan...");
+
+  // Start scanning for 15 seconds
+  // In this time, AdvertisedDeviceCallback::onResult will be called every time a device is picked up
   scanner->start(15);
+
+  // shouldAttemptConnect will be true if the scan picked up the main ESP32 system
   if (shouldAttemptConnect) {
     shouldStart = connectToServer(&targetDevice);
     connectionsManager->setAddressMapping(targetDevice.getAddress(), shouldStart);
@@ -305,6 +327,8 @@ void clearClientInfo() {
   
 }
 
+// This function will be called when the subsystem needs to reconnect to the main system
+// The subsystem will try every 30 seconds to reconnect by scanning. If the main system isn't picked up, it will try again in 30 seconds
 void retryConnection() {
   clearClientInfo();
   Serial.println("Couldn't find/connect to the host ESP32 server. Reattempting connection in 30s.");
@@ -318,23 +342,6 @@ void retryConnection() {
   startScan();
 }
 
-class UltrasonicStatusListener {
-  public:
-  virtual void onUltrasonicStatusChanged(bool newStatus, int sensorNumber) = 0;
-};
-
-class ImplementedListener : public UltrasonicStatusListener {
-  public:
-  void onUltrasonicStatusChanged(bool newStatus, int sensorNumber) override;
-};
-
-void ImplementedListener::onUltrasonicStatusChanged(bool newStatus, int sensorNumber) {
-  Serial.print("Status changed for ultrasonic ");
-  Serial.print(sensorNumber);
-  Serial.print(": ");
-  Serial.println(newStatus);
-}
-
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Proximity sensor class definition/parameters
@@ -343,7 +350,6 @@ void ImplementedListener::onUltrasonicStatusChanged(bool newStatus, int sensorNu
 ////////////////////////////////////////////////////////////////////////////////////////
 class UltrasonicSensor {
   private:
-    UltrasonicStatusListener* listener = nullptr;
     int trigger_pin;
     int echo_pin;
     long duration;
@@ -351,9 +357,6 @@ class UltrasonicSensor {
     int calibratedValue = 0;
     bool isCalibrated = false;
     long unsigned int lastActiveProximity = 0;
-    bool proximityLockLow = true;
-    bool proximityTakeLowTime;
-    long unsigned int proximityLowIn;
     int sensorNumber;
 
     // Boolean that indicates status of the ultrasonic sensor (active or nonactive)
@@ -362,7 +365,7 @@ class UltrasonicSensor {
 
     // Flag that is set to true whenenver the vibration sensor is active
     // When the system is moved, we need to recalibrate the ultrasonic's baseline
-    static bool shouldRetakeBaseline;
+    bool shouldRetakeBaseline = false;
 
   public:
     UltrasonicSensor(int trig_pin, int echo_pin, int sensor_number) {
@@ -373,9 +376,6 @@ class UltrasonicSensor {
       sensorNumber = sensor_number;
     }
 
-    void setListener(UltrasonicStatusListener* listener) {
-      this->listener = listener;
-    }
     int distance() {
       return distance_;
     }
@@ -384,8 +384,8 @@ class UltrasonicSensor {
       return detected;
     }
 
-    static void setBaselineFlag(bool flag) {
-      shouldRetakeBaseline = flag;
+    void shouldRecalibrate() {
+      shouldRetakeBaseline = true;
     }
 
     long unsigned int getDetectionTime() {
@@ -420,43 +420,40 @@ class UltrasonicSensor {
         Serial.println(" cm");
         shouldRetakeBaseline = false;
       }
-      if (distance_ < calibratedValue - 20) {
-        lastActiveProximity = millis();
-        detected = true;
-        if (proximityLockLow) {
-          //makes sure we wait for a transition to LOW before any further output is made:
-          proximityLockLow = false;
-          delay(50);
-        }
-        proximityTakeLowTime = true;
-      }
-      else {
-        if (proximityTakeLowTime) {
-          proximityLowIn = millis();
-          proximityTakeLowTime = false;
-        }
-        if (!proximityLockLow && millis() - proximityLowIn > PROXIMITY_PAUSE) {
-          proximityLockLow = true;
-          detected = false;
-        }
-      }
-    }
 
-    void start() {
+      // Hold the active state for a length of PROXIMITY_PAUSE
+      if (millis() - lastActiveProximity >= PROXIMITY_PAUSE) {
+        if (distance_ < calibratedValue - 20) {
+            lastActiveProximity = millis();
+            detected = true;
+            Serial.print(sensorNumber);
+            Serial.print(" is now active at time ");
+            Serial.print(lastActiveProximity);
+            Serial.print(" with a distance of ");
+            Serial.println(distance_); 
+        } else {
+            detected = false;
+        }
+    }
+} 
+
+    void start(void (*callback) ()) {
       int currentDistance = calculateDistance();
       compareCurrentWithBaseline();
+      if (callback != nullptr) {
+        callback();
+      }
     }
 };
-bool UltrasonicSensor::shouldRetakeBaseline = false;
-
 
 
 // Enum indicating which direction the door is on from the perspective of the system. Default value will be left.
-enum DoorDirection {
+enum class DoorDirection {
   LEFT,
   RIGHT
 };
 
+// Class for the button that can be pressed to recalibrate the ultrasonic sensors
 class Button {
  private:
   int input_pin_;
@@ -475,17 +472,11 @@ class Button {
       Serial.println("Button ISR was never set");
       return;
      }
-     pinMode(input_pin_, INPUT);
+     pinMode(input_pin_, INPUT_PULLDOWN);
      attachInterrupt(input_pin_, interrupt_handler_, RISING);
   }
 };
 
-
-void IRAM_ATTR ButtonPressISR() {
-  UltrasonicSensor::setBaselineFlag(true);
-}
-
-Button button(32, ButtonPressISR);
 
 BluetoothMessenger* bluetoothMessenger = BluetoothMessenger::getInstance();
 
@@ -495,7 +486,28 @@ UltrasonicSensor firstUltrasonicSensor(FIRST_TRIG_PIN, FIRST_ECHO_PIN, ULTRASONI
 // Second sensor will be the right sensor
 UltrasonicSensor secondUltrasonicSensor(SECOND_TRIG_PIN, SECOND_ECHO_PIN, ULTRASONIC_TWO);
 
+// Default door direction setting is assumed to be left (door is to the left of the subsystem)
 DoorDirection direction = DoorDirection::LEFT;
+
+// Interrupt configured for the button, on rising edge when the button is pressed
+// Provides a mechanism to recalibrate the distance of the ultrasonic sensors and switch alternate the DoorDirection enum
+// In the future, it should be a more user friendly interaction
+void IRAM_ATTR ButtonPressISR() {
+  firstUltrasonicSensor.shouldRecalibrate();
+  secondUltrasonicSensor.shouldRecalibrate();
+  switch(direction) {
+    case DoorDirection::LEFT : {
+      direction = DoorDirection::RIGHT;
+      break;
+    }
+    case DoorDirection::RIGHT : {
+      direction = DoorDirection::LEFT;
+      break;
+    }
+  }
+}
+
+Button button(32, ButtonPressISR);
 
 void updateLED(void* parameter) {
   while (true) {
@@ -516,19 +528,17 @@ void setup() {
   Serial.begin(115200);
   Serial.print("Serial port setup complete");
   button.Init();
-//  firstUltrasonicSensor = new UltrasonicSensor(FIRST_TRIG_PIN, FIRST_ECHO_PIN, ULTRASONIC_ONE);
-//  secondUltrasonicSensor = new UltrasonicSensor(SECOND_TRIG_PIN, SECOND_ECHO_PIN, ULTRASONIC_TWO);
-//  roomOccupationInstance->setOnRoomStatusChangedListener([] (String updatedStatus) {
-//      Serial.println(updatedStatus.c_str());
-//  });
 
   pinMode(CONNECTION_LED_PIN, OUTPUT);
   pinMode(STATUS_LED_PIN, OUTPUT);
 
   xTaskCreatePinnedToCore(updateLED, "STATUS_LED", 10000, NULL, 0, NULL, 0);
 
+  // Initializing BLE on the subsystem with the title "ESP32 Subsystem"
   BLEDevice::init("ESP32 Subsystem");
   scanner = BLEDevice::getScan();
+
+  // Set the implemented interface for the advertising so that we can receive the scan result callback properly
   scanner->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallback());
   scanner->setActiveScan(true);
 
@@ -542,28 +552,31 @@ void setup() {
 void loop() {
   if (connectionsManager->shouldStart()) {
     bluetoothMessenger->startMessageService();
-    firstUltrasonicSensor.start();
-    secondUltrasonicSensor.start();
+    firstUltrasonicSensor.start(nullptr);
+    delay(100);
+    secondUltrasonicSensor.start(nullptr);
 
     if (firstUltrasonicSensor.isActive() && secondUltrasonicSensor.isActive()) {
       switch (direction) {
-        case LEFT: {
-            // Person is entering the room
+        // When the door is to the left of the subsystem
+        case DoorDirection::LEFT: {
+            // If the left most ultrasonic was active before the right most ultrasonic (person is entering the room)
             if (firstUltrasonicSensor.getDetectionTime() < secondUltrasonicSensor.getDetectionTime()) {
               roomOccupationInstance->setOccupied();
               
-              // Person is exiting the room
+              // Right most ultrasonic was active before the left ultrasonic (person is leaving the room)
             } else if (firstUltrasonicSensor.getDetectionTime() > secondUltrasonicSensor.getDetectionTime()) {
               roomOccupationInstance->setUnoccupied();
             }
             break;
           }
-        case RIGHT: {
-            // Same idea for the LEFT case, but just switch everything around
+        // When the door is to the right of the subsystem
+        case DoorDirection::RIGHT: {
+            // When the left ultrasonic is active before the right ultrasonic (person is leaving the room)
             if (firstUltrasonicSensor.getDetectionTime() < secondUltrasonicSensor.getDetectionTime()) {
               roomOccupationInstance->setUnoccupied();
 
-              // Person is exiting the room
+              // When the right ultrasonic is active before the left ultrasonic (person is entering the room)
             } else if (firstUltrasonicSensor.getDetectionTime() > secondUltrasonicSensor.getDetectionTime()) {
               roomOccupationInstance->setOccupied();
             }
